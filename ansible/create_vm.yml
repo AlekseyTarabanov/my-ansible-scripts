@@ -1,0 +1,198 @@
+- name: Clone VM from template on Proxmox
+  hosts: localhost
+  gather_facts: true
+  tasks:
+    - name: Clone a new VM from a template
+      community.general.proxmox_kvm:
+        api_user: "{{ proxmox_api_user }}"
+        api_token_id: "{{ proxmox_api_token_id }}"
+        api_token_secret: "{{ proxmox_api_token }}"
+        api_host: "{{ proxmox_host }}"
+        node: "{{ proxmox_node }}"
+        clone: "{{ template_id }}"
+        full: true
+        name: "{{ new_vm_name }}"
+        storage: Disk_600_2
+        state: present
+        onboot: true
+        timeout: 400
+      register: create_vm_result
+
+    - name: wait 20s
+      ansible.builtin.pause:
+        seconds: 20
+
+    - name: Extract new VM ID from message
+      set_fact:
+        new_vm_id_list: "{{ create_vm_result.msg | string | regex_search('newid (\\d+)', '\\1')}}"
+    
+    - name: Set new VM ID
+      set_fact:
+        new_vm_id: "{{ new_vm_id_list[0] | int }}"
+        cacheable: true
+
+    - name: Debug vmid
+      debug:
+        msg: "VM: ID: {{ new_vm_id }}"
+
+    - name: Start VM
+      community.general.proxmox_kvm:
+        api_user: "{{ proxmox_api_user }}"
+        api_token_id: "{{ proxmox_api_token_id }}"
+        api_token_secret: "{{ proxmox_api_token }}"
+        api_host: "{{ proxmox_host }}"
+        name: "{{ new_vm_name }}"
+        node: "{{ proxmox_node }}"
+        state: started
+
+    - name: wait 20s
+      ansible.builtin.pause:
+        seconds: 20
+
+    - name: Get VM IP from QEMU Guest Agent
+      uri:
+        url: "https://{{ proxmox_host }}:8006/api2/json/nodes/{{ proxmox_node }}/qemu/{{ new_vm_id }}/agent/network-get-interfaces"
+        method: GET
+        headers:
+          Authorization: "PVEAPIToken={{ proxmox_api_user }}!{{ proxmox_api_token_id }}={{ proxmox_api_token }}"
+        validate_certs: false
+      register: ip_response
+      retries: 20
+      delay: 6
+      until: ip_response.status == 200
+
+    - name: Set VM IP directly from known interface
+      set_fact:
+        vm_ip: >-
+          {{ ip_response.json.data.result
+             | selectattr('name', 'equalto', 'ens18')
+             | map(attribute='ip-addresses')
+             | list | first
+             | selectattr('ip-address', 'search', '^192\.')
+             | map(attribute='ip-address')
+             | list | first }}
+
+
+    - name: Print found IP
+      debug:
+        msg: "VM IP: {{ vm_ip }}"
+
+    - name: Add new VM to inventory
+      add_host:
+        name: "{{ vm_ip }}"
+        ansible_user: "{{ server_user }}"
+        ansible_ssh_pass: "{{ server_password }}"
+        ansible_ssh_common_args: '-o StrictHostKeyChecking=no'
+        groups: minecraft_servers_group
+        new_vm_id: "{{ new_vm_id }}"
+        vm_ip: "{{ vm_ip }}"
+
+    - name: Wait for SSH on new VM
+      wait_for:
+        port: 22
+        host: "{{ vm_ip }}"
+        timeout: 300
+
+- name: Configure new VM
+  hosts: minecraft_servers_group
+  gather_facts: true
+  vars:
+    vm_ip: "{{ hostvars['localhost']['vm_ip'] }}"
+  tasks:
+    - name: Ensure git is installed
+      become: true
+      apt:
+        name: git
+        state: present
+        update_cache: true
+
+    - name: Clone git repo
+      git:
+        repo: https://github.com/AlekseyTarabanov/servers.git
+        dest: /home/server/minecraft
+        version: "{{ git_branch }}"
+        force: yes
+
+    
+    - name: Start Minecraft server in tmux session
+      become: true
+      become_user: server
+      shell: |
+        tmux new-session -d -s minecraft_server \
+        'cd ~/minecraft/minecraft-server && java21 -jar paper-*.jar nogui'
+      args:
+        executable: /bin/bash
+
+- name: Create nginx config for new Minecraft server
+  hosts: nginx_gateway
+  gather_facts: true
+  become: true
+  vars:
+    site_name: "{{ hostvars['localhost']['new_vm_id'] }}.nek.life"
+    site_file_path: "/etc/nginx/streams-available/{{ hostvars['localhost']['new_vm_id'] }}.nek.life"
+  tasks:
+
+    - name: Get list of used ports from existing stream configs
+      find:
+        paths: /etc/nginx/streams-enabled/
+        patterns: "*.nek.life"
+        use_regex: yes
+      register: existing_streams
+
+    - name: Extract used ports from configs
+      shell: |
+        grep -oP 'listen \K\d+' {{ item.path }}
+      loop: "{{ existing_streams.files }}"
+      register: used_ports_raw
+      changed_when: false
+
+    - name: Build list of used ports
+      set_fact:
+        used_ports: "{{ used_ports_raw.results | map(attribute='stdout') | map('int') | list }}"
+
+    - name: Print list of used ports
+      debug:
+        msg: "Used ports: {{ used_ports }}"
+
+
+    - name: Generate port
+      set_fact:
+        minecraft_port: >-
+          {{
+            (range(25566, 30001) | difference(used_ports) | random)
+          }}
+
+    - name: Print found free port
+      debug:
+        msg: "Port: {{ minecraft_port }}"
+
+    - name: Create TCP proxy config for Minecraft
+      copy:
+        dest: "{{ site_file_path }}"
+        content: |
+          server {
+              listen {{ minecraft_port }};
+              proxy_pass {{ hostvars['localhost']['vm_ip'] }}:25565;
+          }
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Enable site by creating symlink
+      file:
+        src: "{{ site_file_path }}"
+        dest: "/etc/nginx/streams-enabled/{{ hostvars['localhost']['new_vm_id'] }}.nek.life"
+        state: link
+        force: true
+
+    - name: Test nginx config
+      command: nginx -t
+
+    - name: Reload nginx
+      service:
+        name: nginx
+        state: reloaded
+
+    - name: Print conection information
+      debug:
+        msg: "Сервер запущен на nek.life:{{ minecraft_port }} | Локальный ip сервера: {{ hostvars['localhost']['vm_ip'] }} | Номер машины {{ hostvars['localhost']['new_vm_id'] }}"
