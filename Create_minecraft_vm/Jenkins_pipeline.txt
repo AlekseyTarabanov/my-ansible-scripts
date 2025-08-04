@@ -1,0 +1,21 @@
+pipeline {
+    agent any
+
+    environment {
+        ANSIBLE_CONFIG = "${WORKSPACE}/ansible"
+    }
+
+    stages {
+        stage('Clone_VM') {
+            steps {
+                dir('ansible') {
+                    sh """
+                        ansible-playbook -i inventory.ini create_vm.yml \
+                        --extra-vars "new_vm_name=${params.name_vm} git_branch=${params.git_branch}"
+                    """
+                }
+            }
+        }
+    }
+}
+
